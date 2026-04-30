@@ -1,0 +1,28 @@
+[package]
+name    = "pacer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pacer"
+path = "src/lib.rs"
+
+# The bench binary uses Brown's ABtree via C FFI.
+# build.rs compiles cpp/abtree_glue.cpp using the cc crate.
+[[bin]]
+name = "bench"
+path = "src/bench.rs"
+
+[dependencies]
+# No runtime dependencies — PACER core is pure Rust std.
+
+[build-dependencies]
+# cc compiles the C++ ABtree glue layer into a static library.
+cc = "1.0"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level       = 3
+lto             = "thin"
+codegen-units   = 1
