@@ -21,6 +21,10 @@ extern "C" {
     fn abtree_insert(tree: *mut RawAbtree, tid: i32, key: i64) -> i32;
     fn abtree_remove(tree: *mut RawAbtree, tid: i32, key: i64) -> i32;
     fn abtree_contains(tree: *mut RawAbtree, tid: i32, key: i64) -> i32;
+    // Frees a retired node with the same allocator that created it
+    // (::operator delete on the C++ side) — see PacerAllocator::allocate
+    // in cpp/abtree_glue.cpp. Never free these nodes with Rust's allocator.
+    fn abtree_free_node(ptr: *mut u8);
 }
 
 // ── Public helper (called from bench.rs for EBR/token_af strategies) ─────────
@@ -35,7 +39,7 @@ pub unsafe fn set_epoch_for_thread(epoch: u64) {
 /// ptr points to a C++ heap object (operator new) — freed via dealloc in drain().
 unsafe extern "C" fn pacer_retire_cb(birth_ts: u64, ptr: *mut u8, ctx: *mut u8) {
     let t = &mut *(ctx as *mut ThreadLocalState<u64>);
-    t.limbo_bag.push_raw(birth_ts, ptr);
+    t.limbo_bag.push_raw(birth_ts, ptr, abtree_free_node);
 }
 
 // ── Safe wrapper ──────────────────────────────────────────────────────────────
@@ -66,12 +70,22 @@ impl AbtreeFFI {
     }
 
     // ── PACER strategy: insert + GC maintenance ───────────────────────────────
+    //
+    // drain_discrete_tick runs every op (rate-matched to the retire rate);
+    // reclaim_discrete only runs once per WINDOW_SIZE ops (SPI resample +
+    // mode/epoch bookkeeping). Calling only reclaim_discrete here, as this
+    // used to, drains at most a fixed per-window batch while the tree
+    // retires up to WINDOW_SIZE nodes every window — an unbounded native
+    // heap leak. See the cadence-split comment on PacerSystem::reclaim_discrete
+    // in src/lib.rs for how this was found (measured via peak_limbo_len in
+    // examples/sweep.rs) and why it applies here identically.
     pub fn insert<V>(&self, key: u64, sys: &PacerSystem, t: &mut ThreadLocalState<V>) -> bool {
         let ts = self.epoch.fetch_add(1, SeqCst);
         unsafe { abtree_set_epoch(ts); }
         t.win_writes += 1;
         t.op_counter += 1;
         let r = unsafe { abtree_insert(self.raw, t.tid as i32, key as i64) };
+        sys.drain_discrete_tick(t);
         if t.op_counter % WINDOW_SIZE == 0 {
             sys.resample_spi(t);
             sys.reclaim_discrete(t);
@@ -85,6 +99,7 @@ impl AbtreeFFI {
         t.win_writes += 1;
         t.op_counter += 1;
         let r = unsafe { abtree_remove(self.raw, t.tid as i32, key as i64) };
+        sys.drain_discrete_tick(t);
         if t.op_counter % WINDOW_SIZE == 0 {
             sys.resample_spi(t);
             sys.reclaim_discrete(t);

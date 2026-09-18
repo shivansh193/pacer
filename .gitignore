@@ -1,2 +1,4 @@
 /.qodo
 /rustup-init.exe
+/target
+*.zip

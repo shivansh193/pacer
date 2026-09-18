@@ -28,12 +28,37 @@
 #define PACER_SPI_SNAP_HEAVY  0.60
 #define PACER_EMA_ALPHA       0.15
 #define PACER_HOLD_LIMIT      8
+#define PACER_HYSTERESIS      0.05
 
 enum class PacerGcMode { AggressiveEbr, AmortisedFree, ConservativeHold };
+
+// Stateless classification — only used to seed the first decision.
 static inline PacerGcMode pacer_select_mode(double spi) {
     if (spi <= PACER_SPI_WRITE_HEAVY) return PacerGcMode::AggressiveEbr;
     if (spi <= PACER_SPI_SNAP_HEAVY)  return PacerGcMode::AmortisedFree;
     return PacerGcMode::ConservativeHold;
+}
+
+// Hysteresis-aware classification: `prev` only changes once `spi` clears the
+// relevant threshold by more than PACER_HYSTERESIS, so SPI noise sitting
+// near 0.30 or 0.60 can't flip the mode every window. This is what
+// startOp() actually uses.
+static inline PacerGcMode pacer_select_mode_hyst(double spi, PacerGcMode prev) {
+    switch (prev) {
+        case PacerGcMode::AggressiveEbr:
+            if (spi > PACER_SPI_SNAP_HEAVY + PACER_HYSTERESIS)  return PacerGcMode::ConservativeHold;
+            if (spi > PACER_SPI_WRITE_HEAVY + PACER_HYSTERESIS) return PacerGcMode::AmortisedFree;
+            return PacerGcMode::AggressiveEbr;
+        case PacerGcMode::AmortisedFree:
+            if (spi <= PACER_SPI_WRITE_HEAVY - PACER_HYSTERESIS) return PacerGcMode::AggressiveEbr;
+            if (spi > PACER_SPI_SNAP_HEAVY + PACER_HYSTERESIS)   return PacerGcMode::ConservativeHold;
+            return PacerGcMode::AmortisedFree;
+        case PacerGcMode::ConservativeHold:
+        default:
+            if (spi <= PACER_SPI_WRITE_HEAVY - PACER_HYSTERESIS) return PacerGcMode::AggressiveEbr;
+            if (spi <= PACER_SPI_SNAP_HEAVY - PACER_HYSTERESIS)  return PacerGcMode::AmortisedFree;
+            return PacerGcMode::ConservativeHold;
+    }
 }
 
 template <typename T = void, class Pool = pool_interface<T>>
@@ -51,6 +76,7 @@ protected:
         long long     win_snaps;
         double        spi_ema;
         int           hold_ticks;
+        PacerGcMode   gc_mode;
         ThreadData() {}
     private: PAD;
     };
@@ -89,17 +115,22 @@ public:
         setbench_error("getSafeBlockbags not supported by reclaimer_pacer");
     }
 
+    // Must match reclaimer_token1.h (vtoken4) rotateEpochBags exactly: only the
+    // OLD bag `last` (retired before this thread's previous token receipt, so
+    // every thread has since passed through a quiescent point) is safe to free.
+    // The bag currently being retired into (`curr`) must NOT be freed — other
+    // threads may still hold pointers into it. An earlier version swapped
+    // curr<->last first and then handed the just-closed bag to
+    // deamortizedFreeables, freeing nodes from the *current* epoch: a
+    // use-after-free that aborted with "double free or corruption" in ~50% of
+    // 16-thread runs (0 of 13+ for token4/DEBRA on the same workload).
     inline void rotateEpochBags(const int tid) {
-        // Step 1: swap curr <-> last (standard epoch rotation)
-        blockbag<T>* tmp     = threadData[tid].last;
+        blockbag<T>* const freeable = threadData[tid].last;
+        // moves full blocks only; a partially-filled head block stays in
+        // `freeable` (which becomes curr) and is freed a rotation later
+        threadData[tid].deamortizedFreeables->appendMoveFullBlocks(freeable);
         threadData[tid].last = threadData[tid].curr;
-        threadData[tid].curr = tmp;
-
-        // Step 2: move last -> deamortizedFreeables (swap, so last becomes empty)
-        blockbag<T>* tmp2                   = threadData[tid].deamortizedFreeables;
-        threadData[tid].deamortizedFreeables = threadData[tid].last;
-        threadData[tid].last                 = tmp2;
-
+        threadData[tid].curr = freeable;
         // No extra drain at rotation — per-op K=1 handles reclamation (avoids RBF)
     }
 
@@ -151,13 +182,18 @@ public:
 
         // Per-op K=1 drain — always runs, guarantees memory is reclaimed
         // This is identical to token4 and prevents memory starvation at any thread count
-        PacerGcMode mode = pacer_select_mode(td.spi_ema);
+        PacerGcMode mode = pacer_select_mode_hyst(td.spi_ema, td.gc_mode);
+        td.gc_mode = mode;
         if (mode == PacerGcMode::ConservativeHold) {
             // Gate: only drain as safety valve
             td.hold_ticks++;
             if (td.hold_ticks >= PACER_HOLD_LIMIT) {
                 td.hold_ticks = 0;
-                if (!td.deamortizedFreeables->isEmpty()) {
+                // Drain up to PACER_HOLD_LIMIT nodes, not just one — a
+                // single node freed every PACER_HOLD_LIMIT ops still lets
+                // the backlog grow at ~(LIMIT-1)/LIMIT of the retire rate,
+                // which is slower but still unbounded, not actually capped.
+                for (int i = 0; i < PACER_HOLD_LIMIT && !td.deamortizedFreeables->isEmpty(); ++i) {
                     this->pool->add(tid, td.deamortizedFreeables->remove());
                     GSTATS_ADD(tid, limbo_object_frees, 1);
                 }
@@ -198,7 +234,7 @@ public:
     void debugPrintStatus(const int tid) {
         if (tid == 0)
             std::cout << "pacer_spi_ema=" << threadData[0].spi_ema
-                      << " gc_mode=" << (int)pacer_select_mode(threadData[0].spi_ema) << std::endl;
+                      << " gc_mode=" << (int)threadData[0].gc_mode << std::endl;
     }
 
     reclaimer_pacer(const int numProcesses, Pool* _pool, debugInfo* const _debug,
@@ -215,6 +251,7 @@ public:
             threadData[tid].win_snaps            = 0;
             threadData[tid].spi_ema              = 0.0;
             threadData[tid].hold_ticks           = 0;
+            threadData[tid].gc_mode              = PacerGcMode::AggressiveEbr;
         }
     }
     ~reclaimer_pacer() {}
