@@ -2,6 +2,11 @@
 name    = "pacer"
 version = "0.1.0"
 edition = "2021"
+# Cargo only auto-detects a build script at the crate root (`build.rs`).
+# Ours lives under src/, so it must be pointed to explicitly or it is
+# silently never run — which is what was happening before this line existed:
+# cpp/abtree_glue.cpp was never compiled, so `bench` could never link.
+build   = "src/build.rs"
 
 [lib]
 name = "pacer"
@@ -21,8 +26,15 @@ path = "src/bench.rs"
 cc = "1.0"
 
 [dev-dependencies]
+# Exhaustive interleaving checker for the CAS-critical paths (Scc's window
+# generation counter, PacerSystem::try_advance_epoch). Run with:
+#   RUSTFLAGS="--cfg loom" cargo test --release --lib loom_tests
+loom = "0.7"
 
 [profile.release]
 opt-level       = 3
 lto             = "thin"
 codegen-units   = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

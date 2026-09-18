@@ -175,4 +175,13 @@ int abtree_contains(Tree* tree, int tid, long key) {
     return tree->find(tid, key, &val) ? 1 : 0;
 }
 
+// Frees a node retired via the RetireFn callback. Nodes are allocated in
+// PacerAllocator::allocate() with ::operator new, so they must be released
+// with ::operator delete here — not with Rust's global allocator, which
+// knows nothing about this heap. Called from LimboBag::drain on the Rust
+// side once safe_reclaim_ts has passed the node's birth_ts.
+void abtree_free_node(void* ptr) {
+    ::operator delete(ptr);
+}
+
 } // extern "C"
